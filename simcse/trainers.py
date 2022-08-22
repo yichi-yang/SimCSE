@@ -72,74 +72,58 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 if is_datasets_available():
     import datasets
 
-from transformers.trainer import _model_unwrap
+from transformers.trainer import unwrap_model
 from transformers.optimization import Adafactor, AdamW, get_scheduler
 import copy
 # Set path to SentEval
 PATH_TO_SENTEVAL = './SentEval'
 PATH_TO_DATA = './SentEval/data'
 
-# Import SentEval
-sys.path.insert(0, PATH_TO_SENTEVAL)
-import senteval
+# # Import SentEval
+# sys.path.insert(0, PATH_TO_SENTEVAL)
+# import senteval
 import numpy as np
-from datetime import datetime
-from filelock import FileLock
+# from datetime import datetime
+# from filelock import FileLock
+
+import pandas as pd
+from simcse import SimCSE
 
 logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.simcse = SimCSE(
+            None,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            show_encode_progress=False
+        )
+
     def evaluate(
         self,
-        eval_dataset: Optional[Dataset] = None,
-        ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
-        eval_senteval_transfer: bool = False,
+        **kwargs
     ) -> Dict[str, float]:
 
-        # SentEval prepare and batcher
-        def prepare(params, samples):
-            return
-
-        def batcher(params, batch):
-            sentences = [' '.join(s) for s in batch]
-            batch = self.tokenizer.batch_encode_plus(
-                sentences,
-                return_tensors='pt',
-                padding=True,
-            )
-            for k in batch:
-                batch[k] = batch[k].to(self.args.device)
-            with torch.no_grad():
-                outputs = self.model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                pooler_output = outputs.pooler_output
-            return pooler_output.cpu()
-
-        # Set params for SentEval (fastmode)
-        params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
-        params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
-                                            'tenacity': 3, 'epoch_size': 2}
-
-        se = senteval.engine.SE(params, batcher, prepare)
-        tasks = ['STSBenchmark', 'SICKRelatedness']
-        if eval_senteval_transfer or self.args.eval_transfer:
-            tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
         self.model.eval()
-        results = se.eval(tasks)
-        
-        stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
-        sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
+        self.model = self.simcse.model
 
-        metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
-        if eval_senteval_transfer or self.args.eval_transfer:
-            avg_transfer = 0
-            for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
-                avg_transfer += results[task]['devacc']
-                metrics['eval_{}'.format(task)] = results[task]['devacc']
-            avg_transfer /= 7
-            metrics['eval_avg_transfer'] = avg_transfer
-
+        metrics = {}
+        for name, df in self.eval_dataset.items():
+            eval_scores = df.drop(['text', 'triples'], axis=1)
+            eval_scores['similarity'] = 0.
+            for index, row in df.iterrows():
+                similarity = self.simcse.similarity(row['text'], row['triples'])
+                eval_scores.iloc[index, eval_scores.columns.get_loc('similarity')] = similarity
+            pearson_corr = eval_scores.corr(method='pearson')
+            kendall_corr = eval_scores.corr(method='kendall')
+            for criteria in eval_scores.columns:
+                if criteria != 'similarity':
+                    metrics[f'{metric_key_prefix}_{name}_{criteria}_pearson'] = pearson_corr.loc['similarity', criteria]
+                    metrics[f'{metric_key_prefix}_{name}_{criteria}_kendall'] = kendall_corr.loc['similarity', criteria]
         self.log(metrics)
         return metrics
         
@@ -151,7 +135,7 @@ class CLTrainer(Trainer):
 
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save.
-        assert _model_unwrap(model) is self.model, "internal model should be a reference to self.model"
+        assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Determine the new best metric / best model checkpoint
         if metrics is not None and self.args.metric_for_best_model is not None:
@@ -176,7 +160,7 @@ class CLTrainer(Trainer):
                     self.deepspeed.save_checkpoint(output_dir)
 
                 # Save optimizer and scheduler
-                if self.sharded_dpp:
+                if self.sharded_ddp:
                     self.optimizer.consolidate_state_dict()
 
                 if is_torch_tpu_available():
@@ -218,7 +202,7 @@ class CLTrainer(Trainer):
                 self.deepspeed.save_checkpoint(output_dir)
 
             # Save optimizer and scheduler
-            if self.sharded_dpp:
+            if self.sharded_ddp:
                 self.optimizer.consolidate_state_dict()
 
             if is_torch_tpu_available():
@@ -329,7 +313,7 @@ class CLTrainer(Trainer):
             model = torch.nn.DataParallel(model)
 
         # Distributed training (should be after apex fp16 initialization)
-        if self.sharded_dpp:
+        if self.sharded_ddp:
             model = ShardedDDP(model, self.optimizer)
         elif self.args.local_rank != -1:
             model = torch.nn.parallel.DistributedDataParallel(
@@ -504,13 +488,13 @@ class CLTrainer(Trainer):
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, None)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
 
             self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, None)
 
             if self.args.tpu_metrics_debug or self.args.debug:
                 if is_torch_tpu_available():

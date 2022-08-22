@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from sre_constants import ASSERT
 import sys
 from dataclasses import dataclass, field
 from typing import Optional, Union, List, Dict, Tuple
@@ -36,6 +37,7 @@ from transformers.data.data_collator import DataCollatorForLanguageModeling
 from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
 from simcse.models import RobertaForCL, BertForCL
 from simcse.trainers import CLTrainer
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -174,6 +176,10 @@ class DataTrainingArguments:
         default=0.15, 
         metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
     )
+    eval_files: List[str] = field(
+        default_factory=list, 
+        metadata={"help": "The evaluation data files (.txt or .csv)."}
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
@@ -305,9 +311,18 @@ def main():
     if extension == "txt":
         extension = "text"
     if extension == "csv":
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
+        datasets = load_dataset(extension, data_files=data_files, delimiter="\t" if "tsv" in data_args.train_file else ",")
     else:
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
+        datasets = load_dataset(extension, data_files=data_files, )
+
+    eval_datasets = {}
+    for path in data_args.eval_files:
+        sep_idx = path.find(':')
+        assert sep_idx >= 0, 'Please use --eval_file name:path'
+        name = path[:sep_idx]
+        path = path[sep_idx + 1:]
+        df = pd.read_csv(path, keep_default_na=False)
+        eval_datasets[name] = df
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -534,6 +549,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_datasets,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )

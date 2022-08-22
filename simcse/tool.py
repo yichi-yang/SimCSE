@@ -1,4 +1,5 @@
 import logging
+from optparse import Option
 from tqdm import tqdm
 import numpy as np
 from numpy import ndarray
@@ -8,7 +9,9 @@ import transformers
 from transformers import AutoModel, AutoTokenizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
-from typing import List, Dict, Tuple, Type, Union
+from typing import List, Dict, Optional, Tuple, Type, Union
+
+from .models import BertForCL, RobertaForCL
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -20,28 +23,36 @@ class SimCSE(object):
     """
     def __init__(self, model_name_or_path: str, 
                 device: str = None,
+                model: Optional[transformers.PreTrainedModel] = None,
+                tokenizer: Optional[transformers.PreTrainedTokenizerBase] = None,
+                show_encode_progress: bool = True,
                 num_cells: int = 100,
                 num_cells_in_search: int = 10,
                 pooler = None):
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path)
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
+        if model_name_or_path is not None:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            self.model = AutoModel.from_pretrained(model_name_or_path)
+            if device is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model = self.model.to(device)
+            if pooler is not None:
+                self.pooler = pooler
+            elif "unsup" in model_name_or_path:
+                logger.info("Use `cls_before_pooler` for unsupervised models. If you want to use other pooling policy, specify `pooler` argument.")
+                self.pooler = "cls_before_pooler"
+            else:
+                self.pooler = "cls"
+        else:
+            self.model = model
+            self.tokenizer = tokenizer
+            self.pooler = self.model.pooler_type
 
         self.index = None
         self.is_faiss_index = False
         self.num_cells = num_cells
         self.num_cells_in_search = num_cells_in_search
-
-        if pooler is not None:
-            self.pooler = pooler
-        elif "unsup" in model_name_or_path:
-            logger.info("Use `cls_before_pooler` for unsupervised models. If you want to use other pooling policy, specify `pooler` argument.")
-            self.pooler = "cls_before_pooler"
-        else:
-            self.pooler = "cls"
+        self.show_encode_progress = show_encode_progress
     
     def encode(self, sentence: Union[str, List[str]], 
                 device: str = None, 
@@ -51,8 +62,8 @@ class SimCSE(object):
                 batch_size: int = 64,
                 max_length: int = 128) -> Union[ndarray, Tensor]:
 
-        target_device = self.device if device is None else device
-        self.model = self.model.to(target_device)
+        if device is not None:
+            self.model = self.model.to(device)
         
         single_sentence = False
         if isinstance(sentence, str):
@@ -62,7 +73,10 @@ class SimCSE(object):
         embedding_list = [] 
         with torch.no_grad():
             total_batch = len(sentence) // batch_size + (1 if len(sentence) % batch_size > 0 else 0)
-            for batch_id in tqdm(range(total_batch)):
+            batch_ids = range(total_batch)
+            if self.show_encode_progress:
+                batch_ids = tqdm(batch_ids)
+            for batch_id in batch_ids:
                 inputs = self.tokenizer(
                     sentence[batch_id*batch_size:(batch_id+1)*batch_size], 
                     padding=True, 
@@ -70,8 +84,12 @@ class SimCSE(object):
                     max_length=max_length, 
                     return_tensors="pt"
                 )
-                inputs = {k: v.to(target_device) for k, v in inputs.items()}
-                outputs = self.model(**inputs, return_dict=True)
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    if isinstance(self.model, (RobertaForCL, BertForCL)):
+                        outputs = self.model(**inputs, return_dict=True, sent_emb=True)
+                    else:
+                        outputs = self.model(**inputs, return_dict=True)
                 if self.pooler == "cls":
                     embeddings = outputs.pooler_output
                 elif self.pooler == "cls_before_pooler":
