@@ -158,6 +158,14 @@ class DataTrainingArguments:
         default=None, 
         metadata={"help": "The training data file (.txt or .csv)."}
     )
+    eval_file: Optional[str] = field(
+        default=None, 
+        metadata={"help": "The validation data file (.txt or .csv)."}
+    )
+    predict_files: Optional[str] = field(
+        default_factory=list, 
+        metadata={"help": "The predict data files (.txt or .csv).", "nargs": "+"}
+    )
     max_seq_length: Optional[int] = field(
         default=32,
         metadata={
@@ -175,10 +183,6 @@ class DataTrainingArguments:
     mlm_probability: float = field(
         default=0.15, 
         metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
-    )
-    eval_files: List[str] = field(
-        default_factory=list, 
-        metadata={"help": "The evaluation data files (.txt or .csv)."}
     )
 
     def __post_init__(self):
@@ -307,6 +311,7 @@ def main():
     data_files = {}
     if data_args.train_file is not None:
         data_files["train"] = data_args.train_file
+        data_files["validation"] = data_args.eval_file
     extension = data_args.train_file.split(".")[-1]
     if extension == "txt":
         extension = "text"
@@ -315,14 +320,14 @@ def main():
     else:
         datasets = load_dataset(extension, data_files=data_files, )
 
-    eval_datasets = {}
-    for path in data_args.eval_files:
+    predict_datasets = {}
+    for path in data_args.predict_files:
         sep_idx = path.find(':')
-        assert sep_idx >= 0, 'Please use --eval_file name:path'
+        assert sep_idx >= 0, 'Please use --predict_files name:path'
         name = path[:sep_idx]
         path = path[sep_idx + 1:]
         df = pd.read_csv(path, keep_default_na=False)
-        eval_datasets[name] = df
+        predict_datasets[name] = df
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -465,6 +470,15 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
+    if training_args.do_eval :
+        validation_dataset = datasets["validation"].map(
+            prepare_features,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+
     # Data collator
     @dataclass
     class OurDataCollatorWithPadding:
@@ -549,7 +563,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_datasets,
+        eval_dataset=validation_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
     )
@@ -578,9 +592,9 @@ def main():
 
     # Evaluation
     results = {}
-    if training_args.do_eval:
+    if training_args.do_predict:
         logger.info("*** Evaluate ***")
-        results = trainer.evaluate(eval_senteval_transfer=True)
+        results = trainer.predict(predict_datasets, max_length=data_args.max_seq_length)
 
         output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
         if trainer.is_world_process_zero():

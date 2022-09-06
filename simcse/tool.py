@@ -110,9 +110,10 @@ class SimCSE(object):
     
     def similarity(self, queries: Union[str, List[str]], 
                     keys: Union[str, List[str], ndarray], 
-                    device: str = None) -> Union[float, ndarray]:
+                    device: str = None,
+                    max_length: int = 128) -> Union[float, ndarray]:
         
-        query_vecs = self.encode(queries, device=device, return_numpy=True) # suppose N queries
+        query_vecs = self.encode(queries, device=device, return_numpy=True, max_length=max_length) # suppose N queries
         
         if not isinstance(keys, ndarray):
             key_vecs = self.encode(keys, device=device, return_numpy=True) # suppose M keys

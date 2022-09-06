@@ -14,7 +14,7 @@ from packaging import version
 from transformers import Trainer
 from transformers.modeling_utils import PreTrainedModel
 from transformers.training_args import ParallelMode, TrainingArguments
-from transformers.utils import logging
+from transformers.utils import logging, is_sagemaker_mp_enabled
 from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
     BestRun,
@@ -45,6 +45,7 @@ from transformers.trainer_callback import (
 )
 from transformers.trainer_pt_utils import (
     reissue_pt_warnings,
+    nested_detach
 )
 
 from transformers.utils import logging
@@ -93,30 +94,27 @@ logger = logging.get_logger(__name__)
 
 class CLTrainer(Trainer):
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.simcse = SimCSE(
+    def predict(
+        self,
+        test_dataset: Dataset,
+        max_length: int,
+        metric_key_prefix: str = "test"
+    ):
+        self.model.eval()
+
+        simcse = SimCSE(
             None,
             model=self.model,
             tokenizer=self.tokenizer,
             show_encode_progress=False
         )
 
-    def evaluate(
-        self,
-        metric_key_prefix: str = "eval",
-        **kwargs
-    ) -> Dict[str, float]:
-
-        self.model.eval()
-        self.model = self.simcse.model
-
         metrics = {}
-        for name, df in self.eval_dataset.items():
+        for name, df in test_dataset.items():
             eval_scores = df.drop(['text', 'triples'], axis=1)
             eval_scores['similarity'] = 0.
             for index, row in df.iterrows():
-                similarity = self.simcse.similarity(row['text'], row['triples'])
+                similarity = simcse.similarity(row['text'], row['triples'], max_length=max_length)
                 eval_scores.iloc[index, eval_scores.columns.get_loc('similarity')] = similarity
             pearson_corr = eval_scores.corr(method='pearson')
             kendall_corr = eval_scores.corr(method='kendall')
@@ -126,106 +124,154 @@ class CLTrainer(Trainer):
                     metrics[f'{metric_key_prefix}_{name}_{criteria}_kendall'] = kendall_corr.loc['similarity', criteria]
         self.log(metrics)
         return metrics
-        
-    def _save_checkpoint(self, model, trial, metrics=None):
+
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compared to original implementation, we change the saving policy to
-        only save the best-validation checkpoints.
+        Perform an evaluation step on `model` using `inputs`.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to evaluate.
+            inputs (`Dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (`bool`):
+                Whether or not to return the loss only.
+            ignore_keys (`Lst[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
         """
+        inputs = self._prepare_inputs(inputs)
 
-        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
-        # want to save.
-        assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
-
-        # Determine the new best metric / best model checkpoint
-        if metrics is not None and self.args.metric_for_best_model is not None:
-            metric_to_check = self.args.metric_for_best_model
-            if not metric_to_check.startswith("eval_"):
-                metric_to_check = f"eval_{metric_to_check}"
-            metric_value = metrics[metric_to_check]
-
-            operator = np.greater if self.args.greater_is_better else np.less
-            if (
-                self.state.best_metric is None
-                or self.state.best_model_checkpoint is None
-                or operator(metric_value, self.state.best_metric)
-            ):
-                output_dir = self.args.output_dir
-                self.state.best_metric = metric_value
-                self.state.best_model_checkpoint = output_dir
-
-                # Only save model when it is the best one
-                self.save_model(output_dir)
-                if self.deepspeed:
-                    self.deepspeed.save_checkpoint(output_dir)
-
-                # Save optimizer and scheduler
-                if self.sharded_ddp:
-                    self.optimizer.consolidate_state_dict()
-
-                if is_torch_tpu_available():
-                    xm.rendezvous("saving_optimizer_states")
-                    xm.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    with warnings.catch_warnings(record=True) as caught_warnings:
-                        xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                        reissue_pt_warnings(caught_warnings)
-                elif self.is_world_process_zero() and not self.deepspeed:
-                    # deepspeed.save_checkpoint above saves model/optim/sched
-                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    with warnings.catch_warnings(record=True) as caught_warnings:
-                        torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                    reissue_pt_warnings(caught_warnings)
-
-                # Save the Trainer state
-                if self.is_world_process_zero():
-                    self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
-        else:
-            # Save model checkpoint
-            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-
-            if self.hp_search_backend is not None and trial is not None:
-                if self.hp_search_backend == HPSearchBackend.OPTUNA:
-                    run_id = trial.number
-                else:
-                    from ray import tune
-
-                    run_id = tune.get_trial_id()
-                run_name = self.hp_name(trial) if self.hp_name is not None else f"run-{run_id}"
-                output_dir = os.path.join(self.args.output_dir, run_name, checkpoint_folder)
+        with torch.no_grad():
+            if is_sagemaker_mp_enabled():
+                raise NotImplementedError()
             else:
-                output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
+                with self.autocast_smart_context_manager():
+                    outputs = model(**inputs)
+                    loss = outputs['loss'].detach()
+                    logits = outputs['logits']
 
-                self.store_flos()
+        if prediction_loss_only:
+            return (loss, None, None)
 
-            self.save_model(output_dir)
-            if self.deepspeed:
-                self.deepspeed.save_checkpoint(output_dir)
+        logits = nested_detach(logits)
 
-            # Save optimizer and scheduler
-            if self.sharded_ddp:
-                self.optimizer.consolidate_state_dict()
+        return (loss, logits, None)
+        
+    # def _save_checkpoint(self, model, trial, metrics=None):
+    #     """
+    #     Compared to original implementation, we change the saving policy to
+    #     only save the best-validation checkpoints.
+    #     """
 
-            if is_torch_tpu_available():
-                xm.rendezvous("saving_optimizer_states")
-                xm.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                with warnings.catch_warnings(record=True) as caught_warnings:
-                    xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                    reissue_pt_warnings(caught_warnings)
-            elif self.is_world_process_zero() and not self.deepspeed:
-                # deepspeed.save_checkpoint above saves model/optim/sched
-                torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                with warnings.catch_warnings(record=True) as caught_warnings:
-                    torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                reissue_pt_warnings(caught_warnings)
+    #     # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+    #     # want to save.
+    #     assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+    #     # Determine the new best metric / best model checkpoint
+    #     if metrics is not None and self.args.metric_for_best_model is not None:
+    #         metric_to_check = self.args.metric_for_best_model
+    #         if not metric_to_check.startswith("eval_"):
+    #             metric_to_check = f"eval_{metric_to_check}"
+    #         metric_value = metrics[metric_to_check]
+
+    #         operator = np.greater if self.args.greater_is_better else np.less
+    #         if (
+    #             self.state.best_metric is None
+    #             or self.state.best_model_checkpoint is None
+    #             or operator(metric_value, self.state.best_metric)
+    #         ):
+    #             output_dir = self.args.output_dir
+    #             self.state.best_metric = metric_value
+    #             self.state.best_model_checkpoint = output_dir
+
+    #             # Only save model when it is the best one
+    #             self.save_model(output_dir)
+    #             if self.deepspeed:
+    #                 self.deepspeed.save_checkpoint(output_dir)
+
+    #             # Save optimizer and scheduler
+    #             if self.sharded_ddp:
+    #                 self.optimizer.consolidate_state_dict()
+
+    #             if is_torch_tpu_available():
+    #                 xm.rendezvous("saving_optimizer_states")
+    #                 xm.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+    #                 with warnings.catch_warnings(record=True) as caught_warnings:
+    #                     xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+    #                     reissue_pt_warnings(caught_warnings)
+    #             elif self.is_world_process_zero() and not self.deepspeed:
+    #                 # deepspeed.save_checkpoint above saves model/optim/sched
+    #                 torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+    #                 with warnings.catch_warnings(record=True) as caught_warnings:
+    #                     torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+    #                 reissue_pt_warnings(caught_warnings)
+
+    #             # Save the Trainer state
+    #             if self.is_world_process_zero():
+    #                 self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+    #     else:
+    #         # Save model checkpoint
+    #         checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+    #         if self.hp_search_backend is not None and trial is not None:
+    #             if self.hp_search_backend == HPSearchBackend.OPTUNA:
+    #                 run_id = trial.number
+    #             else:
+    #                 from ray import tune
+
+    #                 run_id = tune.get_trial_id()
+    #             run_name = self.hp_name(trial) if self.hp_name is not None else f"run-{run_id}"
+    #             output_dir = os.path.join(self.args.output_dir, run_name, checkpoint_folder)
+    #         else:
+    #             output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
+
+    #             self.store_flos()
+
+    #         self.save_model(output_dir)
+    #         if self.deepspeed:
+    #             self.deepspeed.save_checkpoint(output_dir)
+
+    #         # Save optimizer and scheduler
+    #         if self.sharded_ddp:
+    #             self.optimizer.consolidate_state_dict()
+
+    #         if is_torch_tpu_available():
+    #             xm.rendezvous("saving_optimizer_states")
+    #             xm.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+    #             with warnings.catch_warnings(record=True) as caught_warnings:
+    #                 xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+    #                 reissue_pt_warnings(caught_warnings)
+    #         elif self.is_world_process_zero() and not self.deepspeed:
+    #             # deepspeed.save_checkpoint above saves model/optim/sched
+    #             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+    #             with warnings.catch_warnings(record=True) as caught_warnings:
+    #                 torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+    #             reissue_pt_warnings(caught_warnings)
 
 
-            # Save the Trainer state
-            if self.is_world_process_zero():
-                self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
+    #         # Save the Trainer state
+    #         if self.is_world_process_zero():
+    #             self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
 
-            # Maybe delete some older checkpoints.
-            if self.is_world_process_zero():
-                self._rotate_checkpoints(use_mtime=True)
+    #         # Maybe delete some older checkpoints.
+    #         if self.is_world_process_zero():
+    #             self._rotate_checkpoints(use_mtime=True)
     
     def train(self, model_path: Optional[str] = None, trial: Union["optuna.Trial", Dict[str, Any]] = None):
         """
